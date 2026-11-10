@@ -103,3 +103,46 @@ export const AndroidAssetUrl = {
     return bridge.getAssetUrl(String(relativePath || ""));
   },
 };
+
+/**
+ * MCP transport.
+ *
+ * The desktop build talks to MCP servers from the background service worker,
+ * which the Android target does not build — and a page-side `fetch` would hit
+ * CORS on any server that does not send permissive headers. OkHttp inside the
+ * app process has neither problem, so both MCP messages are funnelled here.
+ *
+ * Native side: WebViewBridge "bds-mcp-http" — returns
+ *   { ok, status, body, sessionId?, contentType?, error? }
+ * Loopback URLs (127.0.0.1 / localhost) may use plain HTTP on Android so an MCP
+ * server running in Termux on the same device can be reached.
+ */
+export const AndroidMcp = {
+  async post({ url, body, apiKey = "", authMethod = "bearer", sessionId = "", timeoutMs = 0 }) {
+    const bridge = getBridge();
+    let raw;
+    try {
+      raw = bridge.fetch(
+        JSON.stringify({
+          type: "bds-mcp-http",
+          url: String(url || ""),
+          body: typeof body === "string" ? body : JSON.stringify(body || {}),
+          apiKey: String(apiKey || ""),
+          authMethod: String(authMethod || "bearer"),
+          sessionId: String(sessionId || ""),
+          timeoutMs: Number(timeoutMs) || 0,
+        })
+      );
+    } catch (err) {
+      return { ok: false, error: String((err && err.message) || err) };
+    }
+    if (typeof raw !== "string" || raw.length === 0) {
+      return { ok: false, error: "Empty response from AndroidBridge.fetch" };
+    }
+    try {
+      return JSON.parse(raw);
+    } catch (err) {
+      return { ok: false, error: "Failed to parse MCP bridge response: " + (err && err.message) };
+    }
+  },
+};

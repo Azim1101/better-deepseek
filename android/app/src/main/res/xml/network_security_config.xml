@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Global policy stays HTTPS-only (usesCleartextTraffic="false" in the manifest).
+
+    The single exception is loopback, for MCP servers running on the device
+    itself. The supported deployment is a Termux-hosted MCP server bound to
+    127.0.0.1, which cannot present a TLS certificate and has no other address;
+    without this exception OkHttp refuses the request outright and every local
+    MCP tool fails with "CLEARTEXT communication not permitted".
+
+    Nothing on the LAN is included here: 192.168/10/172.16 hosts still go
+    through the global HTTPS rule, so this cannot be used to reach a neighbour's
+    service. Keep it that way.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">::1</domain>
+    </domain-config>
+</network-security-config>

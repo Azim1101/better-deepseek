@@ -5,6 +5,7 @@ import {
   AndroidStorage,
   AndroidFetch,
   AndroidAssetUrl,
+  AndroidMcp,
 } from "./android-bridge-shim.js";
 
 function installBridge(overrides = {}) {
@@ -131,5 +132,54 @@ describe("AndroidAssetUrl", () => {
       "https://bds-asset.local/bds/sandbox.html",
     );
     expect(bridge.getAssetUrl).toHaveBeenCalledWith("sandbox.html");
+  });
+});
+
+describe("AndroidMcp", () => {
+  it("sends one bds-mcp-http POST and parses the native answer", async () => {
+    const bridge = installBridge({
+      fetch: vi.fn(() =>
+        JSON.stringify({
+          ok: true,
+          status: 200,
+          body: '{"jsonrpc":"2.0","id":1,"result":{}}',
+          sessionId: "abc",
+          contentType: "application/json",
+        }),
+      ),
+    });
+
+    const response = await AndroidMcp.post({
+      url: "http://127.0.0.1:8765/mcp",
+      body: { jsonrpc: "2.0", id: 1, method: "initialize" },
+      sessionId: "abc",
+    });
+
+    expect(response.ok).toBe(true);
+    expect(response.sessionId).toBe("abc");
+    const payload = JSON.parse(bridge.fetch.mock.calls[0][0]);
+    expect(payload).toMatchObject({
+      type: "bds-mcp-http",
+      url: "http://127.0.0.1:8765/mcp",
+      sessionId: "abc",
+      authMethod: "bearer",
+    });
+    // Objects are serialised for the native side, which expects a string body.
+    expect(JSON.parse(payload.body).method).toBe("initialize");
+  });
+
+  it("turns an empty bridge response into ok:false", async () => {
+    installBridge({ fetch: vi.fn(() => "") });
+    await expect(AndroidMcp.post({ url: "https://x/mcp", body: {} })).resolves.toEqual({
+      ok: false,
+      error: "Empty response from AndroidBridge.fetch",
+    });
+  });
+
+  it("turns an unparseable bridge response into ok:false", async () => {
+    installBridge({ fetch: vi.fn(() => "not json") });
+    const response = await AndroidMcp.post({ url: "https://x/mcp", body: {} });
+    expect(response.ok).toBe(false);
+    expect(response.error).toMatch(/Failed to parse MCP bridge response/);
   });
 });
