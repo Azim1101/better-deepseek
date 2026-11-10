@@ -844,6 +844,7 @@ class WebViewBridge(
      * Supported types: bds-fetch-url -> { ok, status, html } bds-fetch-github-zip -> { ok, base64,
      * status?, authRejected? } bds-fetch-github-commits -> { ok, commits, status?,
      * authRejected?, rateLimited? } bds-get-youtube-transcript -> { ok: false, error: "..." }
+     * bds-mcp-http -> { ok, status, body, sessionId?, contentType? } (one MCP JSON-RPC POST)
      *
      * Unknown types return { ok: false, error: "..." } so the JS side never sees an exception cross
      * the bridge.
@@ -855,6 +856,7 @@ class WebViewBridge(
             val payload = JSONObject(payloadJson ?: "{}")
             when (val type = payload.optString("type")) {
                 "bds-fetch-url" -> handleFetchUrl(payload, response)
+                "bds-mcp-http" -> handleMcpHttp(payload, response)
                 "bds-fetch-github-zip" -> handleFetchGithubZip(payload, response)
                 "bds-fetch-github-commits" -> handleFetchGithubCommits(payload, response)
                 "bds-get-youtube-transcript" -> {
@@ -970,6 +972,100 @@ class WebViewBridge(
                         "Request timed out after ${callTimeoutMs}ms"
                     } else {
                         "Network error: ${e.message ?: e.javaClass.simpleName}"
+                    }
+            )
+        }
+    }
+
+    /**
+     * MCP transport (Streamable HTTP).
+     *
+     * The desktop build reaches MCP servers from the background service worker,
+     * which the Android target does not build; a page-side `fetch` would also be
+     * blocked by CORS on every server that does not send permissive headers.
+     * OkHttp in the app process has neither restriction, so one JSON-RPC POST
+     * per bridge call is enough, and the whole protocol handshake stays in
+     * src/platform/android-chrome-polyfill.js.
+     *
+     * Loopback hosts are reachable over plain HTTP here: the supported Android
+     * deployment is an MCP server running on the device itself (Termux), which
+     * has no HTTPS certificate and no address other than 127.0.0.1. Any other
+     * host still has to be HTTPS, so this cannot be used to reach a LAN service.
+     */
+    private fun handleMcpHttp(payload: JSONObject, response: JSONObject) {
+        val parsed =
+                payload.optString("url").trim().toHttpUrlOrNull()
+                        ?: run {
+                            response.put("ok", false)
+                            response.put("error", "Invalid MCP server URL.")
+                            return
+                        }
+
+        val host = parsed.host.lowercase()
+        val isLoopback =
+                host == "localhost" ||
+                        host == "::1" ||
+                        host == "[::1]" ||
+                        host.startsWith("127.")
+        if (parsed.scheme != "https" && !(parsed.scheme == "http" && isLoopback)) {
+            response.put("ok", false)
+            response.put(
+                    "error",
+                    "Only HTTPS MCP servers are allowed (plain HTTP only for 127.0.0.1/localhost)."
+            )
+            return
+        }
+
+        val body = payload.optString("body").ifEmpty { "{}" }
+        val apiKey = payload.optString("apiKey")
+        val authMethod = payload.optString("authMethod", "bearer")
+        val sessionId = payload.optString("sessionId")
+
+        val builder =
+                Request.Builder()
+                        .url(parsed)
+                        .header("Accept", "application/json, text/event-stream")
+                        .header("Content-Type", "application/json")
+                        .header("User-Agent", DEFAULT_FETCH_USER_AGENT)
+                        .post(body.toRequestBody("application/json".toMediaTypeOrNull()))
+        if (apiKey.isNotEmpty()) {
+            when (authMethod) {
+                "none" -> Unit
+                "x-api-key" -> builder.header("X-API-Key", apiKey)
+                else -> builder.header("Authorization", "Bearer $apiKey")
+            }
+        }
+        if (sessionId.isNotEmpty()) builder.header("Mcp-Session-Id", sessionId)
+
+        val timeoutMs = payload.optLong("timeoutMs", 0L).takeIf { it > 0L } ?: MCP_CALL_TIMEOUT_MS
+        val client =
+                httpClient
+                        .newBuilder()
+                        .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+                        .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+                        .build()
+
+        try {
+            client.newCall(builder.build()).execute().use { resp ->
+                response.put("status", resp.code)
+                response.put("body", resp.body?.string().orEmpty())
+                resp.header("Mcp-Session-Id")?.let { response.put("sessionId", it) }
+                resp.header("Content-Type")?.let { response.put("contentType", it) }
+                if (resp.isSuccessful) {
+                    response.put("ok", true)
+                } else {
+                    response.put("ok", false)
+                    response.put("error", "MCP server returned ${resp.code}")
+                }
+            }
+        } catch (t: Throwable) {
+            response.put("ok", false)
+            response.put(
+                    "error",
+                    if (t is java.net.SocketTimeoutException) {
+                        "MCP server did not respond within ${timeoutMs}ms"
+                    } else {
+                        "Network error: ${t.message ?: t.javaClass.simpleName}"
                     }
             )
         }
@@ -1282,6 +1378,13 @@ class WebViewBridge(
         private const val DEFAULT_FETCH_USER_AGENT =
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         private const val GITHUB_COMMITS_PAGE_SIZE = 100
+
+        /**
+         * Budget for one MCP JSON-RPC round trip. Tool calls that touch the filesystem or run a
+         * command routinely need more than the 20 s connect budget, and a hung server must fail
+         * loudly instead of holding the bridge open for the shared client's 120 s call timeout.
+         */
+        private const val MCP_CALL_TIMEOUT_MS = 45_000L
         // Must match STORAGE_KEYS.pageIsDark in src/lib/constants.js — the Android chrome.storage
         // polyfill routes chrome.storage.local.set({ bds_page_is_dark: ... }) through setStorage,
         // so getLastKnownIsDark() and the polyfill share the same SharedPreferences key.

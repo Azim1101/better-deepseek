@@ -162,6 +162,26 @@ export function isPrivateOrLocalHost(hostname) {
   return false;
 }
 
+/**
+ * Loopback MCP servers are a legitimate deployment on the Android target only.
+ *
+ * There the server runs on the phone itself (Termux), the request never leaves
+ * the device and cannot reach a local network service belonging to someone
+ * else, and loopback is the only address such a server can have. Every other
+ * target keeps the strict rule: an http/private URL there means reaching
+ * services on the user's machine or LAN, which is exactly what the SSRF
+ * protection exists to stop.
+ */
+function isLoopbackHost(hostname) {
+  const host = String(hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+  return host === "localhost" || host === "127.0.0.1" || host === "::1" || host.startsWith("127.");
+}
+
+export function isLocalMcpAllowed(parsed) {
+  const target = process.env.BDS_TARGET || "chrome";
+  return target === "android" && isLoopbackHost(parsed.hostname);
+}
+
 export function validateMcpUrl(rawUrl) {
   const trimmed = String(rawUrl || "").trim();
   if (!trimmed) {
@@ -175,14 +195,18 @@ export function validateMcpUrl(rawUrl) {
     return { valid: false, error: "Invalid server URL." };
   }
 
-  if (parsed.protocol !== "https:") {
+  const local = isLocalMcpAllowed(parsed);
+
+  if (parsed.protocol !== "https:" && !(local && parsed.protocol === "http:")) {
     return {
       valid: false,
-      error: "Insecure MCP server URL: Only HTTPS is allowed. Plain HTTP, localhost, and local network servers are not permitted.",
+      error: local
+        ? "Insecure MCP server URL: HTTPS is required except for 127.0.0.1 / localhost on Android."
+        : "Insecure MCP server URL: Only HTTPS is allowed. Plain HTTP, localhost, and local network servers are not permitted.",
     };
   }
 
-  if (isPrivateOrLocalHost(parsed.hostname)) {
+  if (!local && isPrivateOrLocalHost(parsed.hostname)) {
     return {
       valid: false,
       error: `Blocked private or local network host (${parsed.hostname}). Only public HTTPS MCP servers are permitted.`,

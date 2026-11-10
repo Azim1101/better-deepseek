@@ -188,3 +188,160 @@ describe("merging with an existing chrome global", () => {
     expect(window.chrome.storage.local.get).toBeTypeOf("function");
   });
 });
+
+describe("MCP over the native bridge", () => {
+  /**
+   * The Android target has no background service worker, so the JSON-RPC
+   * handshake runs in the polyfill and the native side only performs one POST.
+   * These tests pin that contract: the message types the rest of the app already
+   * sends must keep working, and nothing may reach AndroidFetch by mistake.
+   */
+
+  function rpcResponse(payload, result, extra = {}) {
+    const request = JSON.parse(payload.body);
+    return JSON.stringify({
+      ok: true,
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ jsonrpc: "2.0", id: request.id, result }),
+      ...extra,
+    });
+  }
+
+  it("answers tools/list through the bridge and reuses the session id", async () => {
+    const calls = [];
+    const { bridge } = installBridge({
+      fetch: vi.fn((payloadJson) => {
+        const payload = JSON.parse(payloadJson);
+        calls.push(payload);
+        const request = JSON.parse(payload.body);
+        if (request.method === "initialize") {
+          return rpcResponse(payload, { protocolVersion: "2024-11-05" }, { sessionId: "sess-42" });
+        }
+        if (request.method === "tools/list") {
+          return rpcResponse(payload, { tools: [{ name: "fs_list" }] });
+        }
+        return JSON.stringify({ ok: true, status: 202, body: "" });
+      }),
+    });
+    installChromePolyfill();
+
+    const response = await chrome.runtime.sendMessage({
+      type: "bds-mcp-list-tools",
+      serverUrl: "http://127.0.0.1:8765/mcp",
+    });
+
+    expect(response).toEqual({ ok: true, tools: { tools: [{ name: "fs_list" }] } });
+    // Loopback plain HTTP is a supported deployment on Android.
+    expect(calls[0]).toMatchObject({
+      type: "bds-mcp-http",
+      url: "http://127.0.0.1:8765/mcp",
+    });
+    const toolsCall = calls.find((c) => JSON.parse(c.body).method === "tools/list");
+    expect(toolsCall.sessionId).toBe("sess-42");
+    // Only the MCP messages are handled here; plain messages stay on AndroidFetch.
+    expect(bridge.fetch).toHaveBeenCalled();
+  });
+
+  it("calls a tool and returns the JSON-RPC result", async () => {
+    installBridge({
+      fetch: vi.fn((payloadJson) => {
+        const request = JSON.parse(JSON.parse(payloadJson).body);
+        if (request.method === "tools/call") {
+          return rpcResponse(
+            { body: JSON.stringify(request) },
+            { content: [{ type: "text", text: "hello from the phone" }] },
+          );
+        }
+        return rpcResponse(
+          { body: JSON.stringify(request) },
+          { protocolVersion: "2024-11-05" },
+        );
+      }),
+    });
+    installChromePolyfill();
+
+    const response = await chrome.runtime.sendMessage({
+      type: "bds-mcp-call",
+      serverUrl: "http://127.0.0.1:8766/mcp",
+      toolName: "fs_read",
+      args: { path: "/sdcard/Documents/a.txt" },
+    });
+
+    expect(response.ok).toBe(true);
+    expect(response.result.content[0].text).toBe("hello from the phone");
+  });
+
+  it("parses an SSE (text/event-stream) answer", async () => {
+    installBridge({
+      fetch: vi.fn((payloadJson) => {
+        const payload = JSON.parse(payloadJson);
+        const request = JSON.parse(payload.body);
+        if (request.method === "initialize") {
+          return JSON.stringify({
+            ok: true,
+            status: 200,
+            contentType: "text/event-stream",
+            body: 'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{}}\n\n',
+          });
+        }
+        return JSON.stringify({
+          ok: true,
+          status: 200,
+          contentType: "text/event-stream",
+          body:
+            'event: message\ndata: {"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"ping"}]}}\n\n',
+        });
+      }),
+    });
+    installChromePolyfill();
+
+    const response = await chrome.runtime.sendMessage({
+      type: "bds-mcp-list-tools",
+      serverUrl: "http://127.0.0.1:8768/mcp",
+    });
+
+    expect(response).toEqual({ ok: true, tools: { tools: [{ name: "ping" }] } });
+  });
+
+  it("falls back from Bearer to X-API-Key when the server rejects the header", async () => {
+    const authHeaders = [];
+    installBridge({
+      fetch: vi.fn((payloadJson) => {
+        const payload = JSON.parse(payloadJson);
+        authHeaders.push(payload.authMethod);
+        const request = JSON.parse(payload.body);
+        if (!authHeaders.includes("x-api-key")) {
+          return JSON.stringify({ ok: false, status: 401, error: "MCP server returned 401" });
+        }
+        return rpcResponse(payload, { tools: [] });
+      }),
+    });
+    installChromePolyfill();
+
+    const response = await chrome.runtime.sendMessage({
+      type: "bds-mcp-list-tools",
+      serverUrl: "http://127.0.0.1:8769/mcp",
+      apiKey: "secret",
+    });
+
+    expect(response.ok).toBe(true);
+    expect(authHeaders.slice(0, 2)).toEqual(["bearer", "x-api-key"]);
+  });
+
+  it("reports a bridge failure as ok:false instead of throwing", async () => {
+    installBridge({
+      fetch: vi.fn(() =>
+        JSON.stringify({ ok: false, status: 500, error: "MCP server returned 500" }),
+      ),
+    });
+    installChromePolyfill();
+
+    const response = await chrome.runtime.sendMessage({
+      type: "bds-mcp-list-tools",
+      serverUrl: "http://127.0.0.1:8770/mcp",
+    });
+
+    expect(response).toEqual({ ok: false, error: "MCP server returned 500" });
+  });
+});

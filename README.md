@@ -71,6 +71,8 @@ Better DeepSeek supports the [Model Context Protocol](https://spec.modelcontextp
 
 *Note: Only secure HTTPS Streamable HTTP transport is supported. Plain HTTP, localhost, private network addresses, and stdio-based MCP servers are not supported.*
 
+*Android exception: the app talks to MCP servers itself instead of through a background worker, so a server running **on the same phone** (e.g. `http://127.0.0.1:8765/mcp` in Termux) is allowed — loopback only, and the manifest's network security config keeps every other cleartext request blocked. See [`tools/termux-mcp/README.md`](tools/termux-mcp/README.md) for a ready-made on-device server (files, shell, clipboard/notifications).*
+
 ### LONG_WORK Project Mode
 When building multi-file projects, DeepSeek can use the `<BDS:LONG_WORK>` tag. All files created inside this block are collected, zipped, and presented as a single download after the block closes. During generation, the user sees only a "Working..." indicator, keeping the chat clean.
 

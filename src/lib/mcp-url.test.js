@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   assertSafeMcpUrl,
+  isLocalMcpAllowed,
   isPrivateOrLocalHost,
   validateMcpUrl,
 } from "./mcp-url.js";
@@ -119,3 +120,55 @@ describe("validateMcpUrl & assertSafeMcpUrl", () => {
   });
 });
 
+
+describe("Android loopback exception", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  function parsed(url) {
+    return new URL(url);
+  }
+
+  it("is only offered to the android target", () => {
+    vi.stubEnv("BDS_TARGET", "chrome");
+    expect(isLocalMcpAllowed(parsed("http://127.0.0.1:8765/mcp"))).toBe(false);
+    vi.stubEnv("BDS_TARGET", "android");
+    expect(isLocalMcpAllowed(parsed("http://127.0.0.1:8765/mcp"))).toBe(true);
+  });
+
+  it("treats only loopback as local on android — never the LAN", () => {
+    vi.stubEnv("BDS_TARGET", "android");
+    expect(isLocalMcpAllowed(parsed("http://localhost:8765/mcp"))).toBe(true);
+    expect(isLocalMcpAllowed(parsed("http://[::1]:8765/mcp"))).toBe(true);
+    expect(isLocalMcpAllowed(parsed("http://127.0.1.1:8765/mcp"))).toBe(true);
+    expect(isLocalMcpAllowed(parsed("http://192.168.1.10:8765/mcp"))).toBe(false);
+    expect(isLocalMcpAllowed(parsed("http://10.0.0.5:8765/mcp"))).toBe(false);
+    expect(isLocalMcpAllowed(parsed("http://my-laptop.local:8765/mcp"))).toBe(false);
+    expect(isLocalMcpAllowed(parsed("https://mcp.exa.ai/mcp"))).toBe(false);
+  });
+
+  it("accepts plain-HTTP loopback MCP servers on android", () => {
+    vi.stubEnv("BDS_TARGET", "android");
+    expect(validateMcpUrl("http://127.0.0.1:8765/mcp")).toEqual({
+      valid: true,
+      url: "http://127.0.0.1:8765/mcp",
+    });
+    expect(validateMcpUrl("http://localhost:8765/mcp").valid).toBe(true);
+    expect(validateMcpUrl("http://[::1]:8765/mcp").valid).toBe(true);
+    // Loopback over HTTPS is still allowed, as on every other target.
+    expect(validateMcpUrl("https://127.0.0.1:8443/mcp").valid).toBe(true);
+    expect(assertSafeMcpUrl("http://127.0.0.1:8765/mcp")).toBe("http://127.0.0.1:8765/mcp");
+  });
+
+  it("keeps public plain HTTP and LAN targets blocked on android", () => {
+    vi.stubEnv("BDS_TARGET", "android");
+    expect(validateMcpUrl("http://mcp.exa.ai/mcp").valid).toBe(false);
+    expect(validateMcpUrl("http://192.168.1.10:8765/mcp").valid).toBe(false);
+    expect(validateMcpUrl("https://192.168.1.10/mcp").valid).toBe(false);
+    expect(validateMcpUrl("ftp://127.0.0.1/mcp").valid).toBe(false);
+    expect(() => assertSafeMcpUrl("http://192.168.1.10:8765/mcp")).toThrow(
+      /Blocked private or local network host|Only HTTPS is allowed/,
+    );
+  });
+});
